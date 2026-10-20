@@ -1,0 +1,31 @@
+# Fail the build when the production site's security headers grade drops below B.
+# Copy to .github/workflows/security-headers.yml in your repository.
+name: Security headers
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * 1'   # every Monday, so a CDN or proxy change is noticed too
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Grade security headers
+        id: headers
+        uses: enterno-io/security-headers-action@v1
+        with:
+          url: https://example.com
+          min-grade: B
+
+      - name: Show the result
+        if: always()
+        env:
+          GRADE: ${{ steps.headers.outputs.grade }}
+          MISSING: ${{ steps.headers.outputs.missing }}
+        run: echo "Grade $GRADE, missing $MISSING"

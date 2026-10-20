@@ -1,0 +1,73 @@
+# Self-test: runs the action from this checkout against public sites.
+# No secrets are used. Two scans per run, well inside the endpoint's free limits.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 5 * * 1'   # weekly, so a change on the endpoint side is noticed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 1. Bad input is rejected before any request is made.
+      - name: Invalid min-grade fails
+        id: invalid
+        continue-on-error: true
+        uses: ./
+        with:
+          url: https://github.com
+          min-grade: Z
+
+      # 2. A well-configured site passes a moderate minimum.
+      - name: Passing grade
+        id: pass
+        uses: ./
+        with:
+          url: https://github.com
+          min-grade: C
+
+      # 3. A site without security headers fails a strict minimum.
+      - name: Failing grade
+        id: fail
+        continue-on-error: true
+        uses: ./
+        with:
+          url: https://example.com
+          min-grade: A+
+
+      - name: Check outcomes
+        env:
+          INVALID_OUTCOME: ${{ steps.invalid.outcome }}
+          PASS_GRADE: ${{ steps.pass.outputs.grade }}
+          PASS_PASSED: ${{ steps.pass.outputs.passed }}
+          FAIL_OUTCOME: ${{ steps.fail.outcome }}
+          FAIL_GRADE: ${{ steps.fail.outputs.grade }}
+          FAIL_PASSED: ${{ steps.fail.outputs.passed }}
+        run: |
+          set -eu
+          echo "invalid: outcome=$INVALID_OUTCOME"
+          echo "pass:    grade=$PASS_GRADE passed=$PASS_PASSED"
+          echo "fail:    grade=$FAIL_GRADE passed=$FAIL_PASSED outcome=$FAIL_OUTCOME"
+          test "$INVALID_OUTCOME" = "failure"
+          test -n "$PASS_GRADE"
+          test "$PASS_PASSED" = "true"
+          test "$FAIL_OUTCOME" = "failure"
+          test -n "$FAIL_GRADE"
+          test "$FAIL_PASSED" = "false"

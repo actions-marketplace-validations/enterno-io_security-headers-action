@@ -1,0 +1,151 @@
+name: 'Security Headers Grade'
+description: 'Grade a URL''s HTTP security headers (A+ to F) and fail the job below a minimum grade. No API key needed.'
+author: 'enterno.io'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  url:
+    description: 'The URL or host name to scan, e.g. https://example.com'
+    required: true
+  min-grade:
+    description: 'Lowest grade that passes: A+, A, B, C, D, E or F. F never fails the job.'
+    required: false
+    default: 'B'
+  follow-redirects:
+    description: 'Follow redirects and grade the final response (true/false).'
+    required: false
+    default: 'true'
+  api-url:
+    description: 'Endpoint to call (https only). Override only to point at a compatible endpoint.'
+    required: false
+    default: 'https://enterno.io/api/securityheaders'
+  fail-on-error:
+    description: 'Fail the job when the scan itself cannot run (network error, rate limit, unreachable site).'
+    required: false
+    default: 'true'
+
+outputs:
+  grade:
+    description: 'The grade, e.g. A+'
+    value: ${{ steps.scan.outputs.grade }}
+  score:
+    description: 'Numeric score 0-100 behind the grade'
+    value: ${{ steps.scan.outputs.score }}
+  missing:
+    description: 'Comma-separated list of missing security headers'
+    value: ${{ steps.scan.outputs.missing }}
+  passed:
+    description: 'true when the grade is at or above min-grade'
+    value: ${{ steps.scan.outputs.passed }}
+  report:
+    description: 'Path to the full JSON report on the runner'
+    value: ${{ steps.scan.outputs.report }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        SH_URL: ${{ inputs.url }}
+        SH_MIN: ${{ inputs.min-grade }}
+        SH_FOLLOW: ${{ inputs.follow-redirects }}
+        SH_API: ${{ inputs.api-url }}
+        SH_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: |
+        set -euo pipefail
+        # Inputs are read from the environment, never interpolated into the
+        # script, so a URL cannot inject shell.
+        rank() {
+          case "$1" in
+            A+) echo 7 ;; A) echo 6 ;; B) echo 5 ;; C) echo 4 ;;
+            D) echo 3 ;; E) echo 2 ;; F) echo 1 ;; *) echo 0 ;;
+          esac
+        }
+        min_rank=$(rank "$SH_MIN")
+        if [ "$min_rank" = "0" ]; then
+          echo "::error::min-grade must be one of A+, A, B, C, D, E, F (got '$SH_MIN')"
+          exit 1
+        fi
+        follow=off
+        case "$(printf '%s' "$SH_FOLLOW" | tr '[:upper:]' '[:lower:]')" in
+          true|on|yes|1) follow=on ;;
+        esac
+
+        report="${RUNNER_TEMP:-/tmp}/security-headers-report.json"
+
+        # Response fields are untrusted: strip newlines and workflow-command
+        # markers before they reach stdout, and validate values before they
+        # become step outputs.
+        clean() { printf '%s' "$1" | tr -d '\r\n' | sed 's/::/: :/g' | cut -c1-300; }
+
+        status=$(curl -sS -o "$report" -w '%{http_code}' --max-time 60 --get \
+          --proto '=https' --proto-redir '=https' \
+          --data-urlencode "q=$SH_URL" \
+          --data-urlencode "followRedirects=$follow" \
+          --data-urlencode "hide=on" \
+          -H "User-Agent: security-headers-action/1.0 (+https://github.com/enterno-io/security-headers-action)" \
+          "$SH_API") || status=000
+
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+
+        if [ "$status" != "200" ]; then
+          msg=$(clean "$(jq -r '.error // empty' "$report" 2>/dev/null || true)")
+          [ -n "$msg" ] || msg="HTTP $status"
+          if [ "$SH_FAIL_ON_ERROR" = "true" ]; then
+            echo "::error::Security headers scan failed: $msg"
+            exit 1
+          fi
+          echo "::warning::Security headers scan failed: $msg"
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if ! jq -e '.status == "good"' "$report" > /dev/null 2>&1; then
+          msg=$(clean "$(jq -r '.error // empty' "$report" 2>/dev/null || true)")
+          echo "::error::Security headers scan returned no grade: ${msg:-the response was not the expected JSON}"
+          exit 1
+        fi
+
+        grade=$(jq -r '.summary.grade' "$report")
+        score=$(jq -r '.summary.score // empty' "$report")
+        missing=$(jq -r '[.missingHeaders // {} | keys[]] | join(",")' "$report")
+        site=$(clean "$(jq -r '.summary.site // empty' "$report")")
+        # [[ =~ ]] anchors match the whole value, newlines included.
+        if ! [[ "$grade" =~ ^(A\+|[A-F]|R)$ ]] \
+          || ! [[ "$score" =~ ^[0-9]{0,3}$ ]] \
+          || ! [[ "$missing" =~ ^[A-Za-z0-9,-]*$ ]]; then
+          echo "::error::Security headers scan returned an unexpected grade, score or header list"
+          exit 1
+        fi
+        echo "grade=$grade" >> "$GITHUB_OUTPUT"
+        echo "score=$score" >> "$GITHUB_OUTPUT"
+        echo "missing=$missing" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### Security headers: $grade"
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| URL | $site |"
+          echo "| Grade | **$grade** (minimum $SH_MIN) |"
+          echo "| Missing | ${missing:-none} |"
+          echo ""
+          echo "Scanned by [enterno.io](https://enterno.io/en/securityheaders-api)."
+        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+        if [ "$grade" = "R" ]; then
+          echo "passed=false" >> "$GITHUB_OUTPUT"
+          echo "::error::The URL answered with a redirect and follow-redirects is false (grade R). Scan the final URL or set follow-redirects: true."
+          exit 1
+        fi
+        if [ "$(rank "$grade")" -lt "$min_rank" ]; then
+          echo "passed=false" >> "$GITHUB_OUTPUT"
+          echo "::error::Security headers grade $grade is below the minimum $SH_MIN (missing: ${missing:-none})"
+          exit 1
+        fi
+        echo "passed=true" >> "$GITHUB_OUTPUT"
+        echo "Security headers grade $grade (minimum $SH_MIN) — passed"
